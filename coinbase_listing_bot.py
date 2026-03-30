@@ -18,7 +18,27 @@ class CoinbaseListingTracker:
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
         self.nitter_urls = ["https://nitter.net/CoinbaseMarkets", "https://nitter.1d4.us/CoinbaseMarkets"]
         self.processed_tweets = set()
-        self.listing_keywords = ["PRE listing", "trading goes live", "now available", "auction", "spot trading", "will go live", "available on coinbase"]
+        self.listing_keywords = [
+            "PRE listing",
+            "trading goes live",
+            "now available",
+            "auction",
+            "spot trading",
+            "will go live",
+            "available on coinbase",
+            "is now live",
+            "based one",
+            "limit-only mode",
+            "enter auction mode",
+            "crosses mid",
+            "trading begins",
+            "listing announcement",
+            "assets added",
+            "contract address",
+            "coinbase exchange",
+            "newly added",
+            "support for"
+        ]
         self.telegram_bot = Bot(token=self.telegram_token)
     
     def get_tweets_from_nitter(self):
