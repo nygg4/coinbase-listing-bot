@@ -4,6 +4,7 @@ import os
 import re
 from telegram import Bot
 from dotenv import load_dotenv
+from bs4 import BeautifulSoup
 import requests
 
 load_dotenv()
@@ -18,9 +19,13 @@ class CoinbaseListingTracker:
     def __init__(self):
         self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
-        self.twitter_bearer_token = os.getenv('TWITTER_BEARER_TOKEN')
         
-        self.coinbase_handle = "CoinbaseMarkets"
+        self.nitter_urls = [
+            "https://nitter.net/CoinbaseMarkets",
+            "https://nitter.1d4.us/CoinbaseMarkets",
+            "https://nitter.poast.org/CoinbaseMarkets"
+        ]
+        
         self.processed_tweets = set()
         
         self.listing_keywords = [
@@ -35,69 +40,91 @@ class CoinbaseListingTracker:
             "trading pair",
             "limit-only mode",
             "enter auction mode",
-            "contract address"
+            "contract address",
+            "assets added"
         ]
         
         self.telegram_bot = Bot(token=self.telegram_token)
     
-    def get_tweets(self):
-        """Fetch recent tweets from Coinbase Markets"""
+    def get_tweets_from_nitter(self):
+        """Fetch tweets from Nitter (free Twitter scraper)"""
         try:
-            logger.info(f"Fetching tweets from @{self.coinbase_handle}...")
+            logger.info("Fetching tweets from Nitter...")
             
-            # Use Twitter API v2 with user_tweets endpoint (requires less permissions)
-            url = "https://api.twitter.com/2/users/by/username/CoinbaseMarkets"
-            headers = {"Authorization": f"Bearer {self.twitter_bearer_token}"}
-            
-            response = requests.get(url, headers=headers)
-            if response.status_code != 200:
-                logger.error(f"Error getting user: {response.status_code} - {response.text}")
-                return
-            
-            user_data = response.json()
-            user_id = user_data['data']['id']
-            
-            # Now get user's recent tweets
-            tweets_url = f"https://api.twitter.com/2/users/{user_id}/tweets?max_results=100&tweet.fields=created_at"
-            response = requests.get(tweets_url, headers=headers)
-            
-            if response.status_code != 200:
-                logger.error(f"Error getting tweets: {response.status_code} - {response.text}")
-                return
-            
-            tweets_data = response.json()
-            
-            if 'data' not in tweets_data:
-                logger.info("No tweets found")
-                return
-            
-            for tweet in tweets_data['data']:
-                tweet_id = tweet['id']
+            for nitter_url in self.nitter_urls:
+                try:
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    }
+                    
+                    response = requests.get(nitter_url, headers=headers, timeout=10)
+                    response.raise_for_status()
+                    
+                    soup = BeautifulSoup(response.content, 'html.parser')
+                    
+                    # Find all tweet containers
+                    tweets = soup.find_all('div', class_='tweet')
+                    
+                    if not tweets:
+                        logger.warning(f"No tweets found on {nitter_url}")
+                        continue
+                    
+                    logger.info(f"Found {len(tweets)} tweets from {nitter_url}")
+                    
+                    for tweet in tweets:
+                        try:
+                            # Get tweet text
+                            text_elem = tweet.find('p', class_='tweet-text')
+                            if not text_elem:
+                                continue
+                            
+                            tweet_text = text_elem.get_text()
+                            
+                            # Get tweet link to extract ID
+                            link_elem = tweet.find('a', class_='tweet-link')
+                            if not link_elem or not link_elem.get('href'):
+                                continue
+                            
+                            tweet_url = link_elem.get('href')
+                            tweet_id = tweet_url.split('/')[-1]
+                            
+                            if tweet_id in self.processed_tweets:
+                                continue
+                            
+                            # Check if it's a listing announcement
+                            if self._is_listing_announcement(tweet_text):
+                                logger.info(f"🎯 Found listing: {tweet_text[:80]}")
+                                
+                                token_symbol = self._extract_token_symbol(tweet_text)
+                                full_url = f"https://x.com/CoinbaseMarkets/status/{tweet_id}"
+                                
+                                self._send_alert(tweet_text, token_symbol, full_url)
+                                self.processed_tweets.add(tweet_id)
+                        
+                        except Exception as e:
+                            logger.error(f"Error processing tweet: {e}")
+                            continue
+                    
+                    return True  # Successfully got tweets
                 
-                if tweet_id in self.processed_tweets:
+                except Exception as e:
+                    logger.warning(f"Error fetching from {nitter_url}: {e}")
                     continue
-                
-                if self._is_listing_announcement(tweet['text']):
-                    logger.info(f"Found listing: {tweet['text'][:80]}")
-                    
-                    token_symbol = self._extract_token_symbol(tweet['text'])
-                    self._send_alert(
-                        tweet['text'],
-                        token_symbol,
-                        f"https://x.com/CoinbaseMarkets/status/{tweet_id}",
-                        tweet['created_at']
-                    )
-                    
-                    self.processed_tweets.add(tweet_id)
+            
+            logger.error("Could not fetch from any Nitter instance")
+            return False
         
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
+            return False
     
     def _is_listing_announcement(self, text):
+        """Check if tweet contains listing keywords"""
         text_lower = text.lower()
         return any(keyword.lower() in text_lower for keyword in self.listing_keywords)
     
     def _extract_token_symbol(self, text):
+        """Extract token symbol from tweet"""
         matches = re.findall(r'\(([A-Z]+)\)', text)
         if matches:
             return matches[0]
@@ -109,7 +136,8 @@ class CoinbaseListingTracker:
         
         return "NEW_TOKEN"
     
-    def _send_alert(self, text, symbol, url, timestamp):
+    def _send_alert(self, text, symbol, url):
+        """Send Telegram alert"""
         try:
             message = f"""
 🚀 **COINBASE LISTING DETECTED**
@@ -120,8 +148,6 @@ class CoinbaseListingTracker:
 {text}
 
 🔗 Tweet: {url}
-
-⏰ Time: {timestamp}
             """
             
             self.telegram_bot.send_message(
@@ -135,12 +161,13 @@ class CoinbaseListingTracker:
             logger.error(f"Error sending alert: {e}", exc_info=True)
     
     def run(self):
-        logger.info("🤖 Coinbase Listing Bot started!")
+        """Main loop"""
+        logger.info("🤖 Coinbase Listing Bot (Nitter) started!")
         
         while True:
             try:
-                self.get_tweets()
-                logger.info("Waiting 60 seconds...")
+                self.get_tweets_from_nitter()
+                logger.info("Waiting 60 seconds for next check...")
                 time.sleep(60)
             except Exception as e:
                 logger.error(f"Error: {e}", exc_info=True)
@@ -152,3 +179,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
+
+Then update **`requirements.txt`** to:
+```
+tweepy==4.14.0
+python-telegram-bot==20.7
+python-dotenv==1.0.0
+beautifulsoup4==4.12.2
+requests==2.31.0
+lxml==4.9.3
