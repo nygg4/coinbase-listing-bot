@@ -1,16 +1,13 @@
-import asyncio
+import time
 import logging
 import os
 import re
-from datetime import datetime
-import tweepy
 from telegram import Bot
 from dotenv import load_dotenv
+import requests
 
-# Load environment variables
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -19,95 +16,88 @@ logger = logging.getLogger(__name__)
 
 class CoinbaseListingTracker:
     def __init__(self):
-        # Twitter/X API credentials
-        self.twitter_bearer_token = os.getenv('TWITTER_BEARER_TOKEN')
-        
-        # Telegram credentials
         self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        self.twitter_bearer_token = os.getenv('TWITTER_BEARER_TOKEN')
         
-        # Coinbase Markets X account
-        self.coinbase_markets_handle = "CoinbaseMarkets"
+        self.coinbase_handle = "CoinbaseMarkets"
+        self.processed_tweets = set()
         
-        # Listing keywords to track
         self.listing_keywords = [
             "PRE listing",
             "trading goes live",
             "now available",
             "now live",
             "auction",
-            "crosses mid",
-            "trading begins",
-            "listing announcement",
-            "will be available"
+            "spot trading",
+            "will go live",
+            "available on coinbase",
+            "trading pair",
+            "limit-only mode",
+            "enter auction mode",
+            "contract address"
         ]
         
-        # Track processed tweet IDs to avoid duplicates
-        self.processed_tweets = set()
-        
-        # Initialize Twitter client (v2 API)
-        self.twitter_client = tweepy.Client(
-            bearer_token=self.twitter_bearer_token,
-            wait_on_rate_limit=True
-        )
-        
-        # Initialize Telegram bot
         self.telegram_bot = Bot(token=self.telegram_token)
-        
-    def search_listings(self):
-        """Search for listing announcements from Coinbase Markets"""
+    
+    def get_tweets(self):
+        """Fetch recent tweets from Coinbase Markets"""
         try:
-            logger.info("Searching for Coinbase Markets listing announcements...")
+            logger.info(f"Fetching tweets from @{self.coinbase_handle}...")
             
-            # Query recent tweets from Coinbase Markets
-            query = f"from:{self.coinbase_markets_handle} (listing OR trading OR auction OR available)"
+            # Use Twitter API v2 with user_tweets endpoint (requires less permissions)
+            url = "https://api.twitter.com/2/users/by/username/CoinbaseMarkets"
+            headers = {"Authorization": f"Bearer {self.twitter_bearer_token}"}
             
-            # Get tweets from last hour
-            response = self.twitter_client.search_recent_tweets(
-                query=query,
-                max_results=100,
-                tweet_fields=['created_at'],
-            )
-            
-            if response.data is None:
-                logger.warning("No tweets found")
+            response = requests.get(url, headers=headers)
+            if response.status_code != 200:
+                logger.error(f"Error getting user: {response.status_code} - {response.text}")
                 return
             
-            # Process tweets
-            for tweet in response.data:
-                tweet_id = tweet.id
+            user_data = response.json()
+            user_id = user_data['data']['id']
+            
+            # Now get user's recent tweets
+            tweets_url = f"https://api.twitter.com/2/users/{user_id}/tweets?max_results=100&tweet.fields=created_at"
+            response = requests.get(tweets_url, headers=headers)
+            
+            if response.status_code != 200:
+                logger.error(f"Error getting tweets: {response.status_code} - {response.text}")
+                return
+            
+            tweets_data = response.json()
+            
+            if 'data' not in tweets_data:
+                logger.info("No tweets found")
+                return
+            
+            for tweet in tweets_data['data']:
+                tweet_id = tweet['id']
                 
-                # Skip if already processed
                 if tweet_id in self.processed_tweets:
                     continue
                 
-                # Check if tweet contains listing keywords
-                if self._is_listing_announcement(tweet.text):
-                    logger.info(f"Found listing announcement: {tweet.text[:100]}")
+                if self._is_listing_announcement(tweet['text']):
+                    logger.info(f"Found listing: {tweet['text'][:80]}")
                     
-                    # Extract token symbol
-                    token_symbol = self._extract_token_symbol(tweet.text)
-                    
-                    # Send Telegram alert
-                    self._send_telegram_alert(
-                        tweet_text=tweet.text,
-                        token_symbol=token_symbol,
-                        tweet_url=f"https://x.com/{self.coinbase_markets_handle}/status/{tweet_id}",
-                        created_at=tweet.created_at
+                    token_symbol = self._extract_token_symbol(tweet['text'])
+                    self._send_alert(
+                        tweet['text'],
+                        token_symbol,
+                        f"https://x.com/CoinbaseMarkets/status/{tweet_id}",
+                        tweet['created_at']
                     )
                     
                     self.processed_tweets.add(tweet_id)
-            
+        
         except Exception as e:
-            logger.error(f"Error searching listings: {e}", exc_info=True)
+            logger.error(f"Error: {e}", exc_info=True)
     
     def _is_listing_announcement(self, text):
-        """Check if tweet text contains listing-related keywords"""
         text_lower = text.lower()
         return any(keyword.lower() in text_lower for keyword in self.listing_keywords)
     
     def _extract_token_symbol(self, text):
-        """Extract token symbol from announcement text"""
         matches = re.findall(r'\(([A-Z]+)\)', text)
         if matches:
             return matches[0]
@@ -119,20 +109,19 @@ class CoinbaseListingTracker:
         
         return "NEW_TOKEN"
     
-    def _send_telegram_alert(self, tweet_text, token_symbol, tweet_url, created_at):
-        """Send Telegram notification"""
+    def _send_alert(self, text, symbol, url, timestamp):
         try:
             message = f"""
 🚀 **COINBASE LISTING DETECTED**
 
-📌 Token: `{token_symbol}`
+📌 Token: `{symbol}`
 
 📝 Announcement:
-{tweet_text}
+{text}
 
-🔗 Tweet: {tweet_url}
+🔗 Tweet: {url}
 
-⏰ Time: {created_at.strftime('%Y-%m-%d %H:%M:%S UTC')}
+⏰ Time: {timestamp}
             """
             
             self.telegram_bot.send_message(
@@ -141,31 +130,25 @@ class CoinbaseListingTracker:
                 parse_mode='Markdown'
             )
             
-            logger.info(f"✅ Telegram alert sent for {token_symbol}")
-            
+            logger.info(f"✅ Alert sent for {symbol}")
         except Exception as e:
-            logger.error(f"Error sending Telegram alert: {e}", exc_info=True)
+            logger.error(f"Error sending alert: {e}", exc_info=True)
     
     def run(self):
-        """Main loop: polling"""
         logger.info("🤖 Coinbase Listing Bot started!")
         
         while True:
             try:
-                self.search_listings()
-                logger.info("Waiting 30 seconds for next check...")
-                import time
-                time.sleep(30)
-            except Exception as e:
-                logger.error(f"Error in main loop: {e}", exc_info=True)
-                import time
+                self.get_tweets()
+                logger.info("Waiting 60 seconds...")
                 time.sleep(60)
-
+            except Exception as e:
+                logger.error(f"Error: {e}", exc_info=True)
+                time.sleep(60)
 
 def main():
     tracker = CoinbaseListingTracker()
     tracker.run()
-
 
 if __name__ == "__main__":
     main()
